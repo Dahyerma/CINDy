@@ -7,7 +7,7 @@ from sklearn.preprocessing import PolynomialFeatures
 from sklearn.linear_model import Lasso
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, Subset
 from tqdm import trange
 import yaml
 
@@ -85,7 +85,10 @@ breakpoint()
 
 
 dataset = PEMFCDataset(df)
-dataloader = DataLoader(dataset, batch_size=32, shuffle=True, drop_last=True)
+by_cycle_indices = dataset.divide_cycle(whole_sequence=True)
+subsets = [Subset(dataset, idxs) for idxs in by_cycle_indices]
+train_dataset = ConcatDataset(subsets)
+dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, drop_last=True)
 
 epochs = 1000
 model = ParameterizedSINDy(input_dim=3, output_dim=4, x_dim=2)  # 3개의 입력 (RH_a, RH_c, cycle), 4개의 출력 (dV_dn)
