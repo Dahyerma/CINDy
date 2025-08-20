@@ -7,7 +7,7 @@ class PEMFCDataset(Dataset):
     def __init__(self, df, target_cycle=None, preprocess_config=None):
         """
         PEMFC 데이터셋 초기화
-        :param df: DataFrame with columns ['Voltage', 'CurrentDensity', 'RH_a', 'RH_c', 'cycle']
+        :param df: DataFrame with columns ['Voltage', 'CurrentDensity', 'RH_a_norm', 'RH_c_norm', 'cycle']
         :param target_cycle: 특정 사이클에 대한 데이터만 사용할 경우 지정
         :param preprocess_config: 사전 처리 설정 (예: 정규화, 추가 피처 생성 등) --> key: "power", 
         """
@@ -16,40 +16,99 @@ class PEMFCDataset(Dataset):
         
         self.X = df[['Voltage', 'CurrentDensity']].values
         self.condition = df[['RH_a_norm', 'RH_c_norm', 'cycle']].values
+        # 사이클 구분은 'Ns' 대신 파일명에서 파싱한 'cycle' 값을 사용
+        self.cycles = df['cycle'].values
 
-        self.ns = df['Ns'].values
+        self.theta = None
+        self.theta_names = []
+        self.cfg = None
+      
 
     def __len__(self):
-        return len(self.X) - 1
+        return max(0, len(self.X) - 1)
 
     def __getitem__(self, idx):
-        return torch.tensor(self.X[idx], dtype=torch.float32), torch.tensor(self.X[idx + 1], dtype=torch.float32), torch.tensor(self.condition[idx], dtype=torch.float32)
-    
+        x0=torch.tensor(self.X[idx], dtype=torch.float32)
+        x1=torch.tensor(self.X[idx + 1], dtype=torch.float32)
+        condition = torch.tensor(self.condition[idx], dtype=torch.float32)
+        th = torch.tensor(self.theta[idx], dtype=torch.float32) 
+        
+        return x0, x1, condition, th
+      
     ## TODO tasks ##
     ## 1. 데이터셋을 사이클 별로도 쪼개야 합니다. 
-    ## 2. I, V 외에도 I^2, Sin(I), Cos(I), I*V I^2*V ,.... 등의 갖가지 변술르 X에 포함시키세요.
+    ## 2. I, V 외에도 I^2, Sin(I), Cos(I), I*V I^2*V ,.... 등의 갖가지 변수를 X에 포함시키세요.
 
     def divide_cycle(self, whole_sequence):
-        ns = np.array(self.ns)
-        n = len(ns)
+        cycles_arr = np.array(self.cycles)
+        global start
+        n = len(cycles_arr)
         if n == 0:
             return [] if whole_sequence else {}
 
-        cycles = []
-        start_idx = 0
+        ranges = []
+        start = 0
         for i in range(1, n):
-            if ns[i-1] == 2 and ns[i] == 0:
-                cycles.append((start_idx, i))
-                start_idx = i
-        
-        cycles.append((start_idx, n))
+            if cycles_arr[i] != cycles_arr[i-1]:
+                ranges.append((start, i))
+                start = i
+        ranges.append((start, n))
+
 
         if whole_sequence:
-            return cycles
+            out = []
+            for start, end in ranges:
+                if end - start >= 2:
+                    out.append(np.arange(start, end - 1))
+                else:
+                    out.append([])
+            return out
+        else:
+            result = {}
+            for start, end in ranges:
+                c = cycles_arr[start]
+                if end - start >= 2:
+                    result[c] = np.arange(start, end - 1)
+                else:
+                    result[c] = []
+            return result
         
-        return {idx: (s, e) for idx, (s, e) in enumerate(cycles)}
-        
-    
-    def preprocess(self):
-        # self.X[:, -1] = self.X[0] ** 2 
-        raise NotImplementedError("Preprocessing method not implemented. Please implement the preprocessing logic as needed.")
+    def make_library(self, V, I, cfg):
+        order = (cfg.get('polynomial_order', 1))
+        add_trig = cfg.get('triangular_function', False)
+        add_exp = cfg.get('exponential_function', False)
+        clip = cfg.get('exp_arg_clip', 8.0)
+
+        feat_cols = []
+        feat_names = []
+
+        #1) Polynomial features
+        for total_deg in range(1, order + 1):
+            for a in range(total_deg + 1):
+                b = total_deg - a
+                feat_cols.append((V ** a) * (I ** b))
+                feat_names.append(f'V^{a}_I^{b}')
+
+        #2) Trigonometric features
+        if add_trig:
+            feat_cols +=[np.sin(I).astype(np.float32), np.cos(I).astype(np.float32)]
+            feat_names += ['sin(I)', 'cos(I)']
+
+        #3) Exponential features
+        if add_exp:
+            I_clip = np.clip(I, -clip, clip)
+            feat_cols += [np.exp(I_clip).astype(np.float32)]
+            feat_names += ['exp(I)']
+
+        theta = np.column_stack(feat_cols).astype(np.float32)
+        return theta, feat_names
+
+
+            
+    def preprocess(self, cfg: dict):
+        self.cfg = cfg
+        V = self.X[:, 0]
+        I = self.X[:, 1]
+        theta, names = self.make_library(V, I, cfg)
+        self.theta = theta
+        self.theta_names = names

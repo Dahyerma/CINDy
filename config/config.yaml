@@ -1,0 +1,4 @@
+polynomial_order: 3
+triangular_function: True
+exponential_function: True
+exp_arg_clip: 8.0

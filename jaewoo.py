@@ -80,11 +80,13 @@ df = df_all.dropna(subset=['dV_dn']).reset_index(drop=True)
 
 
 
-config = yaml.safe_load(open('config.yaml', 'r'))
-breakpoint()
+config = yaml.safe_load(open('./config/config.yaml', 'r'))
+
 
 
 dataset = PEMFCDataset(df)
+dataset.preprocess(config)
+
 by_cycle_indices = dataset.divide_cycle(whole_sequence=True)
 subsets = [Subset(dataset, idxs) for idxs in by_cycle_indices]
 train_dataset = ConcatDataset(subsets)
@@ -96,7 +98,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 loss_fn = nn.MSELoss()
 
 for epoch in trange(epochs, desc='Training'):
-    for x, next_X, condition in dataloader:
+    for x, next_X, condition, th in dataloader:
         optimizer.zero_grad()
         loss = model.get_loss(x, next_X, condition)  # Voltage는 X[:, 0:1]
         loss.backward()
@@ -106,3 +108,61 @@ for epoch in trange(epochs, desc='Training'):
         print(f'Epoch [{epoch + 1}/{epochs}], Loss: {loss.item():.4f}')
 
 
+def compute_dX_batch(model, X_np, condition_np):
+    with torch.no_grad():
+        X_t = torch.tensor(X_np, dtype=torch.float32)
+        cond_t = torch.tensor(condition_np, dtype=torch.float32)
+        batch_size = X_t.size(0)
+        predicted_SINDy = model.forward(cond_t).view(batch_size, -1, model.x_dim)
+        dX_t = torch.einsum('bij,bjk->bik', predicted_SINDy, X_t.unsqueeze(-1)).squeeze(-1)
+        return dX_t.cpu().numpy()
+
+# ------------------------------------------------------------------------------
+# 8. IV 커브 예측 및 플롯 (RH=30/80, cycle=0 → 15)
+# ------------------------------------------------------------------------------
+c1, c2       = 0.30, 0.80
+target_cycle = 15
+
+# 조건에 맞는 데이터만, 사이클·전류밀도 기준 정렬
+df_cond = (
+    df_all[(df_all['RH_a_norm']==c1)&(df_all['RH_c_norm']==c2)]
+    .sort_values(['cycle','CurrentDensity'])
+    .reset_index(drop=True)
+)
+
+# 초기 cycle=0
+df_init = df_cond[df_cond['cycle']==0]
+V_pred  = df_init['Voltage'].values.copy()
+J_vals  = df_init['CurrentDensity'].values.copy()
+
+# 누적 예측
+for n in range(0, target_cycle):
+    X_batch = np.stack([V_pred, J_vals], axis=1)
+    condition_batch = np.column_stack([
+        np.full_like(J_vals, c1, dtype=np.float32),
+        np.full_like(J_vals, c2, dtype=np.float32),
+        np.full_like(J_vals, n+1, dtype=np.float32),
+    ])
+    dX = compute_dX_batch(model, X_batch, condition_batch)
+    V_pred = V_pred + dX[:, 0]
+
+# 실제 15사이클
+df15 = df_cond[df_cond['cycle']==target_cycle]
+
+# 스무딩된 예측 커브
+V_pred_smooth = smooth_voltage(J_vals, V_pred, frac=0.2)
+
+# 플롯
+plt.figure(figsize=(8,6))
+plt.plot(df15['CurrentDensity'], df15['Voltage'],
+         'o', label=f'Actual Cycle {target_cycle}')
+plt.plot(J_vals, V_pred_smooth,
+         '-', label=f'SINDy Predicted (smoothed) Cycle {target_cycle}')
+plt.xlabel('Current Density (A/cm²)')
+plt.ylabel('Voltage (V)')
+plt.title(f'IV Curve @ RH={int(c1*100)}/{int(c2*100)}, Cycle {target_cycle}')
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+
+plt.savefig('iv_curve_prediction.png')
