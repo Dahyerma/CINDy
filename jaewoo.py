@@ -1,168 +1,149 @@
-import glob
-import re
-import numpy as np
-import pandas as pd
+# train.py  ────────────────────────────────────────────────────────────────────
+import glob, re, numpy as np, pandas as pd, yaml, torch
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import PolynomialFeatures
-from sklearn.linear_model import Lasso
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, ConcatDataset, Subset
-from tqdm import trange
-import yaml
-
+from statsmodels.nonparametric.smoothers_lowess import lowess
+from torch.utils.data import DataLoader
 from data_util import PEMFCDataset
 from model import ParameterizedSINDy
 
-# ------------------------------------------------------------------------------
-# 1. 데이터 불러오기 · 전처리 (스무딩 포함)
-# ------------------------------------------------------------------------------
-from statsmodels.nonparametric.smoothers_lowess import lowess
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def smooth_voltage(x, y, frac=0.2):
-    """
-    LOESS 스무딩 후, 원래 x 지점에 대응하는 y_smooth 반환
-    x, y: 1D numpy arrays
-    """
     sm = lowess(y, x, frac=frac, return_sorted=True)
     xs, ys = sm[:,0], sm[:,1]
     return np.interp(x, xs, ys)
 
+# ── (A) 원시 데이터 적재
 all_dfs = []
 for fp in glob.glob('data/RHa_*_RHc_*_*.csv'):
     df0 = pd.read_csv(fp, encoding='cp949')
     if 'Voltage(V)' not in df0.columns or 'Current(A)' not in df0.columns:
         continue
+    df = (df0[['Voltage(V)', 'Current(A)']]
+          .dropna()
+          .rename(columns={'Voltage(V)':'Voltage'}))
+    df['CurrentDensity'] = df['Current(A)']/25.0
+    df['Voltage'] = smooth_voltage(df['CurrentDensity'].values, df['Voltage'].values, frac=0.2)
 
-    # 전압·전류 컬럼 정리
-    df = (
-        df0[['Voltage(V)', 'Current(A)']]
-        .dropna()
-        .rename(columns={'Voltage(V)': 'Voltage'})
-    )
-    # 전류밀도 계산
-    df['CurrentDensity'] = df['Current(A)'] / 25.0
-
-    # LOESS 스무딩 적용
-    df['Voltage'] = smooth_voltage(
-        df['CurrentDensity'].values,
-        df['Voltage'].values,
-        frac=0.2
-    )
-
-    # 파일명에서 RH_a, RH_c, cycle 파싱
     m = re.search(r'RHa_(\d+)_RHc_(\d+)_(\d+)\.csv$', fp)
-    if not m:
+    if not m: 
         continue
-    df['RH_a']      = int(m.group(1))
-    df['RH_c']      = int(m.group(2))
-    df['cycle']     = int(m.group(3))
-    # 0–1 정규화
-    df['RH_a_norm'] = df['RH_a'] / 100.0
-    df['RH_c_norm'] = df['RH_c'] / 100.0
-
+    df['RH_a'] = int(m.group(1)); df['RH_c'] = int(m.group(2)); df['cycle'] = int(m.group(3))
+    df['RH_a_norm'] = df['RH_a']/100.0; df['RH_c_norm'] = df['RH_c']/100.0
     all_dfs.append(df[['Voltage','CurrentDensity','RH_a_norm','RH_c_norm','cycle']])
 
 if not all_dfs:
-    raise RuntimeError("데이터가 하나도 읽히지 않았습니다. 파일 패턴과 컬럼명을 확인하세요.")
+    raise RuntimeError("데이터가 하나도 읽히지 않았습니다.")
+
 df_all = pd.concat(all_dfs, ignore_index=True)
+cycle_max = df_all['cycle'].max()
+df_all['cycle_norm'] = df_all['cycle'] / max(1, cycle_max)
 
-# ------------------------------------------------------------------------------
-# 2. dV/dn 계산
-# ------------------------------------------------------------------------------
-df_all['dV_dn'] = (
-    df_all
-    .groupby(['CurrentDensity','RH_a_norm','RH_c_norm'])['Voltage']
-    .diff()
+# ── (B) n→n+1 페어 만들기 (같은 RH, 같은 V_bin에서)
+df_all = df_all.sort_values(['RH_a_norm','RH_c_norm','Voltage','cycle']).reset_index(drop=True)
+
+# 1) 전압 binning (필요시 자릿수 조절: 3~5)
+df_all['V_bin'] = df_all['Voltage'].round(4)
+
+# 2) 왼쪽: cycle = n
+left = df_all[['RH_a_norm','RH_c_norm','V_bin','cycle','cycle_norm','Voltage','CurrentDensity']].rename(
+    columns={'CurrentDensity': 'I_n'}
 )
-df = df_all.dropna(subset=['dV_dn']).reset_index(drop=True)
+
+# 3) 오른쪽: cycle = n+1 을 n에 맞추도록 cycle을 -1 이동
+right = df_all[['RH_a_norm','RH_c_norm','V_bin','cycle','CurrentDensity']].rename(
+    columns={'CurrentDensity': 'I_np1', 'cycle': 'cycle_next'}
+)
+right['cycle'] = right['cycle_next'] - 1
+right = right.drop(columns=['cycle_next'])
+
+# 4) 키 조인: (RH, V_bin, cycle) 기준으로 n ↔ n+1 매칭
+df_pairs = pd.merge(
+    left, right,
+    on=['RH_a_norm','RH_c_norm','V_bin','cycle'],
+    how='inner'
+)
+
+# 5) Dataset이 기대하는 컬럼명으로 정리
+df_pairs = df_pairs.rename(columns={'I_np1': 'NextCurrentDensity',
+                                    'I_n':   'CurrentDensity'})
+
+# 최종 컬럼만 남기기
+df_pairs = df_pairs[['Voltage','CurrentDensity','NextCurrentDensity',
+                     'RH_a_norm','RH_c_norm','cycle','cycle_norm']]
 
 
-
-
+# ── (C) Dataset/Loader
 config = yaml.safe_load(open('./config/config.yaml', 'r'))
+dataset = PEMFCDataset(df_pairs)
+dataset.preprocess(config)             # Θ(V,I_n)
+F = dataset.theta.shape[1]             # 라이브러리 항 수
 
+loader = DataLoader(dataset, batch_size=1024, shuffle=True, pin_memory=(device.type=='cuda'))
 
+# ── (D) Model/Train (I만)
+model = ParameterizedSINDy(
+    input_dim=3,               # RH_a_norm, RH_c_norm, cycle_norm
+    output_dim=F,              # F * D (D=1)
+    x_dim=1,
+    lasso_regularization=1e-4,
+    hidden_dim=64
+).to(device)
 
-dataset = PEMFCDataset(df)
-dataset.preprocess(config)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-by_cycle_indices = dataset.divide_cycle(whole_sequence=True)
-subsets = [Subset(dataset, idxs) for idxs in by_cycle_indices]
-train_dataset = ConcatDataset(subsets)
-dataloader = DataLoader(train_dataset, batch_size=32, shuffle=True, drop_last=True)
+for epoch in range(1000):
+    for x, next_X, cond, th in loader:
 
-epochs = 1000
-model = ParameterizedSINDy(input_dim=3, output_dim=4, x_dim=2)  # 3개의 입력 (RH_a, RH_c, cycle), 4개의 출력 (dV_dn)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)   
-loss_fn = nn.MSELoss()
-
-for epoch in trange(epochs, desc='Training'):
-    for x, next_X, condition, th in dataloader:
-        optimizer.zero_grad()
-        loss = model.get_loss(x, next_X, condition)  # Voltage는 X[:, 0:1]
+        x, next_X, cond, th = x.to(device), next_X.to(device), cond.to(device), th.to(device)
+        opt.zero_grad()
+        loss = model.get_loss(x, next_X, th, cond)
         loss.backward()
-        optimizer.step()
+        opt.step()
+    if (epoch+1) % 100 == 0:
+        print(f"[{epoch+1}] loss={loss.item():.6f}")
 
-    if (epoch + 1) % 100 == 0:
-        print(f'Epoch [{epoch + 1}/{epochs}], Loss: {loss.item():.4f}')
-
-
-def compute_dX_batch(model, X_np, condition_np):
+# ── (E) 추론: Θ·Ξ로 dI 누적 (V 그리드 고정)
+def compute_dI_step(model, V_np, I_np, cond_np, cfg):
+    theta_np, _ = dataset.make_library(V_np.astype(np.float32), I_np.astype(np.float32), cfg)
     with torch.no_grad():
-        X_t = torch.tensor(X_np, dtype=torch.float32)
-        cond_t = torch.tensor(condition_np, dtype=torch.float32)
-        batch_size = X_t.size(0)
-        predicted_SINDy = model.forward(cond_t).view(batch_size, -1, model.x_dim)
-        dX_t = torch.einsum('bij,bjk->bik', predicted_SINDy, X_t.unsqueeze(-1)).squeeze(-1)
-        return dX_t.cpu().numpy()
+        theta  = torch.tensor(theta_np, dtype=torch.float32, device=device) # [B,F]
+        cond   = torch.tensor(cond_np,  dtype=torch.float32, device=device) # [B,3]
+        Xi     = model.forward(cond)                                        # [B,F]
+        dI     = torch.sum(Xi * theta, dim=1)                               # [B]
+        return dI.cpu().numpy()
 
-# ------------------------------------------------------------------------------
-# 8. IV 커브 예측 및 플롯 (RH=30/80, cycle=0 → 15)
-# ------------------------------------------------------------------------------
-c1, c2       = 0.30, 0.80
+# 예시: RH=30/80, cycle 0→15
+c1, c2 = 0.30, 0.80
 target_cycle = 15
 
-# 조건에 맞는 데이터만, 사이클·전류밀도 기준 정렬
-df_cond = (
-    df_all[(df_all['RH_a_norm']==c1)&(df_all['RH_c_norm']==c2)]
-    .sort_values(['cycle','CurrentDensity'])
-    .reset_index(drop=True)
-)
-
-# 초기 cycle=0
+df_cond = (df_all[(df_all['RH_a_norm']==c1) & (df_all['RH_c_norm']==c2)]
+           .sort_values(['cycle','Voltage']).reset_index(drop=True))
 df_init = df_cond[df_cond['cycle']==0]
-V_pred  = df_init['Voltage'].values.copy()
-J_vals  = df_init['CurrentDensity'].values.copy()
+V_grid  = df_init['Voltage'].values.astype(np.float32).copy()
+I_pred  = df_init['CurrentDensity'].values.astype(np.float32).copy()
 
-# 누적 예측
 for n in range(0, target_cycle):
-    X_batch = np.stack([V_pred, J_vals], axis=1)
-    condition_batch = np.column_stack([
-        np.full_like(J_vals, c1, dtype=np.float32),
-        np.full_like(J_vals, c2, dtype=np.float32),
-        np.full_like(J_vals, n+1, dtype=np.float32),
+    cond_batch = np.column_stack([
+        np.full_like(V_grid, c1, dtype=np.float32),
+        np.full_like(V_grid, c2, dtype=np.float32),
+        np.full_like(V_grid, (n+1)/max(1, cycle_max), dtype=np.float32)   # cycle_norm
     ])
-    dX = compute_dX_batch(model, X_batch, condition_batch)
-    V_pred = V_pred + dX[:, 0]
+    dI = compute_dI_step(model, V_grid, I_pred, cond_batch, config)
+    I_pred = I_pred + dI
 
-# 실제 15사이클
-df15 = df_cond[df_cond['cycle']==target_cycle]
+# 시각화 (선택)
+import matplotlib.pyplot as plt
+def smooth_voltage_curve(V, I, frac=0.2):
+    return smooth_voltage(V, I, frac=frac)
 
-# 스무딩된 예측 커브
-V_pred_smooth = smooth_voltage(J_vals, V_pred, frac=0.2)
+I_pred_smooth = smooth_voltage_curve(V_grid, I_pred, frac=0.2)
+df_tgt = df_cond[df_cond['cycle']==target_cycle]
 
-# 플롯
 plt.figure(figsize=(8,6))
-plt.plot(df15['CurrentDensity'], df15['Voltage'],
-         'o', label=f'Actual Cycle {target_cycle}')
-plt.plot(J_vals, V_pred_smooth,
-         '-', label=f'SINDy Predicted (smoothed) Cycle {target_cycle}')
-plt.xlabel('Current Density (A/cm²)')
-plt.ylabel('Voltage (V)')
+plt.plot(df_tgt['CurrentDensity'], df_tgt['Voltage'], 'o', label=f'Actual Cycle {target_cycle}')
+plt.plot(I_pred_smooth, V_grid, '-', label=f'Predicted (smoothed) Cycle {target_cycle}')
+plt.xlabel('Current Density (A/cm²)'); plt.ylabel('Voltage (V)')
 plt.title(f'IV Curve @ RH={int(c1*100)}/{int(c2*100)}, Cycle {target_cycle}')
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-
-plt.savefig('iv_curve_prediction.png')
+plt.legend(); plt.grid(True); plt.tight_layout()
+plt.savefig('iv_curve_prediction_I_Re.png')
